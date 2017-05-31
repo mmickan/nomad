@@ -459,7 +459,7 @@ func (t *TaskEnvironment) ClearEnvvars() *TaskEnvironment {
 func (t *TaskEnvironment) SetAlloc(alloc *structs.Allocation) *TaskEnvironment {
 	t.AllocId = alloc.ID
 	t.AllocName = alloc.Name
-	t.AllocIndex = alloc.Index()
+	t.AllocIndex = int(alloc.Index())
 	t.Alloc = alloc
 	return t
 }
