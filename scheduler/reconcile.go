@@ -44,6 +44,9 @@ type allocReconciler struct {
 	// deploymentPaused marks whether the deployment is paused
 	deploymentPaused bool
 
+	// deploymentFailed marks whether the deployment is failed
+	deploymentFailed bool
+
 	// taintedNodes contains a map of nodes that are tainted
 	taintedNodes map[string]*structs.Node
 
@@ -119,6 +122,7 @@ func NewAllocReconciler(logger *log.Logger, allocUpdateFn allocUpdateType, batch
 	// Detect if the deployment is paused
 	if deployment != nil {
 		a.deploymentPaused = deployment.Status == structs.DeploymentStatusPaused
+		a.deploymentFailed = deployment.Status == structs.DeploymentStatusFailed
 	}
 
 	return a
@@ -152,9 +156,9 @@ func (a *allocReconciler) Compute() *reconcileResults {
 // computeDeployments cancels any deployment that is not needed and creates a
 // deployment if it is needed
 func (a *allocReconciler) computeDeployments() {
-	// If the job is stopped and there is a deployment cancel it
+	// If the job is stopped and there is a deployment non-terminal deployment, cancel it
 	if a.job.Stopped() {
-		if a.deployment != nil {
+		if a.deployment != nil && a.deployment.Active() {
 			a.result.deploymentUpdates = append(a.result.deploymentUpdates, &structs.DeploymentStatusUpdate{
 				DeploymentID:      a.deployment.ID,
 				Status:            structs.DeploymentStatusCancelled,
@@ -168,7 +172,7 @@ func (a *allocReconciler) computeDeployments() {
 
 	// Check if the deployment is referencing an older job and cancel it
 	if d := a.deployment; d != nil {
-		if d.JobCreateIndex != a.job.CreateIndex || d.JobModifyIndex != a.job.JobModifyIndex {
+		if d.Active() && (d.JobCreateIndex != a.job.CreateIndex || d.JobModifyIndex != a.job.JobModifyIndex) {
 			a.result.deploymentUpdates = append(a.result.deploymentUpdates, &structs.DeploymentStatusUpdate{
 				DeploymentID:      a.deployment.ID,
 				Status:            structs.DeploymentStatusCancelled,
@@ -178,6 +182,7 @@ func (a *allocReconciler) computeDeployments() {
 		}
 	}
 
+	// XXX Should probably do this as needed
 	// Create a new deployment if necessary
 	if a.deployment == nil && !a.job.Stopped() && a.job.HasUpdateStrategy() {
 		a.deployment = structs.NewDeployment(a.job)
@@ -261,10 +266,6 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 			current, older := canaries.filterByDeployment(a.deployment.ID)
 			a.markStop(older, "", allocNotNeeded)
 			desiredChanges.Stop += uint64(len(older))
-
-			a.logger.Printf("RECONCILER -- older canaries %#v", older)
-			a.logger.Printf("RECONCILER -- current canaries %#v", current)
-
 			untainted = untainted.difference(older)
 			canaries = current
 		} else {
@@ -275,7 +276,6 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 			untainted = untainted.difference(canaries)
 			canaries = nil
 		}
-		a.logger.Printf("RECONCILER -- untainted - remove canaries %#v", untainted)
 	}
 
 	// Create a structure for choosing names. Seed with the taken names which is
@@ -303,7 +303,6 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 	ignore, inplace, destructive := a.computeUpdates(tg, untainted)
 	desiredChanges.Ignore += uint64(len(ignore))
 	desiredChanges.InPlaceUpdate += uint64(len(inplace))
-	desiredChanges.DestructiveUpdate += uint64(len(destructive))
 
 	a.logger.Printf("RECONCILER -- Stopping (%d)", len(stop))
 	a.logger.Printf("RECONCILER -- Inplace (%d); Destructive (%d)", len(inplace), len(destructive))
@@ -313,7 +312,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 	numDestructive := len(destructive)
 	strategy := tg.Update
 	requireCanary := numDestructive != 0 && strategy != nil && len(canaries) < strategy.Canary
-	if requireCanary && !a.deploymentPaused {
+	if requireCanary && !a.deploymentPaused && !a.deploymentFailed {
 		number := strategy.Canary - len(canaries)
 		number = helper.IntMin(numDestructive, number)
 		desiredChanges.Canary += uint64(number)
@@ -338,7 +337,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 	a.logger.Printf("RECONCILER -- LIMIT %v", limit)
 
 	// Place if:
-	// * The deployment is not paused
+	// * The deployment is not paused or failed
 	// * Not placing any canaries
 	// * If there are any canaries that they have been promoted
 	place := a.computePlacements(tg, nameIndex, untainted, migrate)
@@ -346,7 +345,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 		dstate.DesiredTotal += len(place)
 	}
 
-	if !a.deploymentPaused && existingCanariesPromoted {
+	if !a.deploymentPaused && !a.deploymentFailed && existingCanariesPromoted {
 		// Update the desired changes and if we are creating a deployment update
 		// the state.
 		desiredChanges.Place += uint64(len(place))
@@ -360,6 +359,7 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 		// Do all destructive updates
 		min := helper.IntMin(len(destructive), limit)
 		i := 0
+		desiredChanges.DestructiveUpdate += uint64(min)
 		a.logger.Printf("RECONCILER -- Destructive Updating (%d)", min)
 		for _, alloc := range destructive {
 			if i == min {
@@ -378,23 +378,30 @@ func (a *allocReconciler) computeGroup(group string, all allocSet) {
 			})
 		}
 		limit -= min
+	} else {
+		desiredChanges.Ignore += uint64(len(destructive))
 	}
 
 	// TODO Migrations should be done using a stagger and max_parallel.
-	desiredChanges.Migrate += uint64(len(migrate))
-	a.logger.Printf("RECONCILER -- Migrating (%d)", len(migrate))
-	for _, alloc := range migrate {
-		a.result.stop = append(a.result.stop, allocStopResult{
-			alloc:             alloc,
-			statusDescription: allocMigrating,
-		})
-		a.result.place = append(a.result.place, allocPlaceResult{
-			name:          alloc.Name,
-			canary:        false,
-			taskGroup:     tg,
-			previousAlloc: alloc,
-		})
+	if !a.deploymentFailed {
+		desiredChanges.Migrate += uint64(len(migrate))
+		a.logger.Printf("RECONCILER -- Migrating (%d)", len(migrate))
+		for _, alloc := range migrate {
+			a.result.stop = append(a.result.stop, allocStopResult{
+				alloc:             alloc,
+				statusDescription: allocMigrating,
+			})
+			a.result.place = append(a.result.place, allocPlaceResult{
+				name:          alloc.Name,
+				canary:        false,
+				taskGroup:     tg,
+				previousAlloc: alloc,
+			})
+		}
+	} else {
+		desiredChanges.Ignore += uint64(len(migrate))
 	}
+
 }
 
 // computeLimit returns the placement limit for a particular group. The inputs
@@ -468,6 +475,7 @@ func (a *allocReconciler) computeStop(group *structs.TaskGroup, nameIndex *alloc
 	if !promoted {
 		// Canaries are in the untainted set and should be discounted.
 		untainted = untainted.difference(canaries)
+		a.logger.Printf("ALEX -- STOPPING discounting canaries %#v", canaries)
 	}
 
 	// Hot path the nothing to do case
